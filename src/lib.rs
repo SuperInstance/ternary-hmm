@@ -281,16 +281,24 @@ impl TernaryHMM {
         }
 
         let mut likelihoods = Vec::new();
+        let mut prev_log_lik: Option<f64> = None;
 
         for _iter in 0..max_iter {
             let (alpha, scales, likelihood) = self.forward_scaled(obs)?;
             let beta = self.backward_scaled(obs, &scales)?;
+            // Log-likelihood = sum of log(scales) stays finite even when P(O) =
+            // prod(scales) underflows to 0 for long sequences; it drives the
+            // convergence/exit decisions below.
+            let log_lik: f64 = scales
+                .iter()
+                .map(|&c| if c > 0.0 { c.ln() } else { f64::NEG_INFINITY })
+                .sum();
             likelihoods.push(likelihood);
 
-            // `likelihood == 0` means the observation sequence is impossible under
-            // the current model (a genuinely zero-probability emission along the
-            // only reachable path); there is nothing to re-estimate.
-            if likelihood == 0.0 {
+            // A -inf log-likelihood means an observation is genuinely impossible
+            // (a zero-probability emission along every reachable path); there is
+            // nothing to re-estimate.
+            if !log_lik.is_finite() {
                 break;
             }
 
@@ -361,12 +369,12 @@ impl TernaryHMM {
                 }
             }
 
-            if likelihoods.len() >= 2 {
-                let prev = likelihoods[likelihoods.len() - 2];
-                if (likelihood - prev).abs() < tol {
+            if let Some(prev) = prev_log_lik {
+                if (log_lik - prev).abs() < tol {
                     break;
                 }
             }
+            prev_log_lik = Some(log_lik);
         }
 
         Ok(likelihoods)
@@ -512,9 +520,11 @@ mod tests {
         let likelihoods = hmm.baum_welch(&obs, 50, 1e-8).unwrap();
         assert!(likelihoods.len() > 1, "Should have multiple iterations");
         let final_likelihood = *likelihoods.last().unwrap();
+        // STRICT improvement: an M-step that updates nothing leaves the likelihood
+        // unchanged, so a non-strict `>=` test would pass on a broken trainer.
         assert!(
-            final_likelihood >= initial_likelihood - 1e-10,
-            "Likelihood should not decrease: initial={initial_likelihood}, final={final_likelihood}"
+            final_likelihood > initial_likelihood,
+            "Likelihood must strictly increase: initial={initial_likelihood}, final={final_likelihood}"
         );
     }
 
@@ -574,6 +584,7 @@ mod tests {
             Positive,
         ];
         let likelihoods = hmm.baum_welch(&obs, 100, 1e-12).unwrap();
+        // Monotonic non-decreasing across all iterations ...
         for w in likelihoods.windows(2) {
             assert!(
                 w[1] >= w[0] - 1e-10,
@@ -582,5 +593,169 @@ mod tests {
                 w[1]
             );
         }
+        // ... but NOT all-equal: a no-op M-step leaves every likelihood identical,
+        // so requiring at least one strict increase defeats that fake-green case.
+        let any_strict_increase = likelihoods.windows(2).any(|w| w[1] > w[0] + 1e-12);
+        assert!(
+            any_strict_increase,
+            "Likelihood never strictly increased across {} iterations — EM M-step may be inert",
+            likelihoods.len()
+        );
+    }
+
+    /// Independent verification of Viterbi: brute-force enumerate ALL 3^T state
+    /// paths, compute each path's joint probability with the observations, and
+    /// confirm Viterbi returns a maximum-probability path with matching log-prob.
+    #[test]
+    fn test_viterbi_matches_brute_force() {
+        let pi = [0.5, 0.3, 0.2];
+        let a = [[0.6, 0.2, 0.2], [0.3, 0.4, 0.3], [0.1, 0.3, 0.6]];
+        let b = [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1], [0.1, 0.2, 0.7]];
+        let hmm = TernaryHMM::with_params(pi, a, b).unwrap();
+        let obs = vec![Positive, Negative, Positive, Neutral]; // T=4 -> 81 paths
+        let o: Vec<usize> = obs.iter().map(|&t| trit_to_index(t)).collect();
+        let t = o.len();
+
+        // Brute force over every state-index sequence.
+        let mut best_prob = -1.0_f64;
+        for code in 0..3usize.pow(t as u32) {
+            let mut path = vec![0usize; t];
+            let mut c = code;
+            for slot in path.iter_mut().rev() {
+                *slot = c % 3;
+                c /= 3;
+            }
+            let mut p = pi[path[0]] * b[path[0]][o[0]];
+            for k in 1..t {
+                p *= a[path[k - 1]][path[k]] * b[path[k]][o[k]];
+            }
+            if p > best_prob {
+                best_prob = p;
+            }
+        }
+
+        let (vpath, vlog) = hmm.viterbi(&obs).unwrap();
+        // The probability of the Viterbi-returned path must equal the brute-force max.
+        let vidx: Vec<usize> = vpath.iter().map(|&t| trit_to_index(t)).collect();
+        let mut vprob = pi[vidx[0]] * b[vidx[0]][o[0]];
+        for k in 1..t {
+            vprob *= a[vidx[k - 1]][vidx[k]] * b[vidx[k]][o[k]];
+        }
+        assert!(
+            (vprob - best_prob).abs() < 1e-12,
+            "Viterbi path prob {vprob} != brute-force max {best_prob}"
+        );
+        assert!(
+            (vlog - best_prob.ln()).abs() < 1e-9,
+            "Viterbi log-prob {vlog} != ln(brute-force max) {}",
+            best_prob.ln()
+        );
+    }
+
+    #[test]
+    fn test_with_params_rejects_invalid_probabilities() {
+        // Negative entry whose row still sums to 1 (would yield ln(negative)=NaN).
+        assert!(TernaryHMM::with_params(
+            [2.0, -0.5, -0.5],
+            [[1.0 / 3.0; 3]; 3],
+            [[1.0 / 3.0; 3]; 3]
+        )
+        .is_err());
+        // Negative value inside a transition row.
+        assert!(TernaryHMM::with_params(
+            [1.0 / 3.0; 3],
+            [[1.4, -0.2, -0.2], [1.0 / 3.0; 3], [1.0 / 3.0; 3]],
+            [[1.0 / 3.0; 3]; 3]
+        )
+        .is_err());
+        // NaN (note: its row sum is NaN, which the sum check alone would miss
+        // because `(NaN - 1.0).abs() > 1e-6` is false).
+        assert!(TernaryHMM::with_params(
+            [f64::NAN, 0.0, 1.0],
+            [[1.0 / 3.0; 3]; 3],
+            [[1.0 / 3.0; 3]; 3]
+        )
+        .is_err());
+        // Infinity.
+        assert!(TernaryHMM::with_params(
+            [1.0 / 3.0; 3],
+            [[1.0 / 3.0; 3]; 3],
+            [
+                [f64::INFINITY, f64::NEG_INFINITY, 1.0],
+                [1.0 / 3.0; 3],
+                [1.0 / 3.0; 3]
+            ]
+        )
+        .is_err());
+        // A valid model still constructs.
+        assert!(make_simple_hmm().pi.iter().all(|&v| v >= 0.0));
+    }
+
+    #[test]
+    fn test_filtering_smoothing_agree_on_clean_signal() {
+        // Strongly diagonal model + clean observations: filtering (past only) and
+        // smoothing (all observations) should agree at interior time steps.
+        let pi = [1.0 / 3.0; 3];
+        let a = [[0.9, 0.05, 0.05], [0.05, 0.9, 0.05], [0.05, 0.05, 0.9]];
+        let b = [
+            [0.95, 0.025, 0.025],
+            [0.025, 0.95, 0.025],
+            [0.025, 0.025, 0.95],
+        ];
+        let hmm = TernaryHMM::with_params(pi, a, b).unwrap();
+        let obs = vec![Negative, Negative, Neutral, Positive, Positive];
+        for t in 1..obs.len() - 1 {
+            let filt = hmm.predict_state(&obs, t).unwrap();
+            let smooth = hmm.smooth_state(&obs, t).unwrap();
+            assert_eq!(filt, smooth, "filtering != smoothing at t={t}");
+            assert_eq!(filt, obs[t], "decoded state != observed at t={t}");
+        }
+    }
+
+    #[test]
+    fn test_baum_welch_long_sequence_stable() {
+        // T=700: the OLD unscaled forward underflowed P(O) to 0.0, so baum_welch
+        // hit `likelihood == 0.0` and silently broke after one iteration. With
+        // scaling + log-space convergence, training proceeds normally.
+        //
+        // A perfectly uniform start is a Baum-Welch fixed point (the three states
+        // are indistinguishable), so we start from a symmetry-broken, diagonal-
+        // biased init on a blocky sequence whose sticky structure is learnable.
+        let mut hmm = TernaryHMM::with_params(
+            [0.34, 0.33, 0.33],
+            [[0.36, 0.32, 0.32], [0.32, 0.36, 0.32], [0.32, 0.32, 0.36]],
+            [[0.36, 0.32, 0.32], [0.32, 0.36, 0.32], [0.32, 0.32, 0.36]],
+        )
+        .unwrap();
+        let init_a = hmm.a;
+        // Long runs of each symbol => sticky transition structure to learn.
+        let obs: Vec<_> = (0..700usize)
+            .map(|i| match (i / 70) % 3 {
+                0 => Negative,
+                1 => Neutral,
+                _ => Positive,
+            })
+            .collect();
+        let likelihoods = hmm.baum_welch(&obs, 50, 1e-10).unwrap();
+        // Multiple real iterations => no immediate underflow exit.
+        assert!(
+            likelihoods.len() >= 2,
+            "baum_welch exited immediately (underflow?)"
+        );
+        // Transition matrix actually moved => M-step ran with correctly-scaled
+        // (non-underflowed) gamma.
+        let moved = hmm
+            .a
+            .iter()
+            .flatten()
+            .zip(init_a.iter().flatten())
+            .any(|(&x, &u)| (x - u).abs() > 1e-9);
+        assert!(
+            moved,
+            "baum_welch did not update transition matrix on T=700"
+        );
+        // Inference on the long sequence must not panic or produce NaN.
+        assert!(hmm.predict_state(&obs, 500).is_ok());
+        assert!(hmm.smooth_state(&obs, 500).is_ok());
     }
 }
