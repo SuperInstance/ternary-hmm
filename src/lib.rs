@@ -1,20 +1,11 @@
 //! # ternary-hmm
 //!
-//! Hidden Markov Model with ternary states {-1, 0, +1} and ternary emissions.
-//! Implements forward algorithm, backward algorithm, Viterbi decoding,
-//! Baum-Welch training (ternary-constrained), and sequence likelihood.
-//!
-//! The forward and backward recursions use **Rabiner scaling** (each time-step
-//! is normalized by its own scaling coefficient) so that the filtering and
-//! smoothing distributions never underflow to zero, even for long observation
-//! sequences. With raw (unscaled) probabilities the joint `P(O_0..O_t, state_t)`
-//! is a product of many sub-unit terms and collapses to `0.0` for sequences of a
-//! few hundred observations, which silently breaks training and smoothing.
-//!
-//! Uses [`Ternary`] from `ternary-types` as the shared fleet type.
+//! This crate's documentation is the [`README.md`](https://github.com/SuperInstance/ternary-hmm/blob/master/README.md),
+//! which is included here so its code examples are compiled and run as doctests.
+#![doc = include_str!("../README.md")]
 
-use ternary_types::Ternary;
-use ternary_types::Ternary::{Negative, Neutral, Positive};
+pub use ternary_types::Ternary;
+pub use ternary_types::Ternary::{Negative, Neutral, Positive};
 
 /// The three possible ternary states.
 pub const STATES: [Ternary; 3] = [Negative, Neutral, Positive];
