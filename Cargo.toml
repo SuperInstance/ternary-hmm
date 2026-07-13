@@ -3,7 +3,7 @@ description = "ternary-hmm - SuperInstance ecosystem crate"
 repository = "https://github.com/SuperInstance/ternary-hmm"
 name = "ternary-hmm"
 version = "0.1.0"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 edition = "2021"
 
 [dependencies]

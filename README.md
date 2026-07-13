@@ -20,47 +20,58 @@ An HMM over ternary symbols has a natural symmetry: state −1 should emit −1,
 
 ```rust
 use ternary_hmm::TernaryHMM;
+use ternary_hmm::Ternary::{Negative, Neutral, Positive};
 
 // Define the model: states {-1, 0, +1}, emissions {-1, 0, +1}
-let pi = [0.2, 0.5, 0.3];           // initial state distribution
-let a = [                              // transition matrix
-    [0.7, 0.2, 0.1],  // from −1: likely to stay −1
-    [0.1, 0.8, 0.1],  // from  0: very sticky
-    [0.1, 0.2, 0.7],  // from +1: likely to stay +1
+let pi = [0.2, 0.5, 0.3]; // initial state distribution
+let a = [
+    // transition matrix
+    [0.7, 0.2, 0.1], // from -1: likely to stay -1
+    [0.1, 0.8, 0.1], // from  0: very sticky
+    [0.1, 0.2, 0.7], // from +1: likely to stay +1
 ];
-let b = [                              // emission matrix
-    [0.8, 0.1, 0.1],  // state −1 → emits −1 mostly
-    [0.1, 0.8, 0.1],  // state  0 → emits  0 mostly
-    [0.1, 0.1, 0.8],  // state +1 → emits +1 mostly
+let b = [
+    // emission matrix
+    [0.8, 0.1, 0.1], // state -1 -> emits -1 mostly
+    [0.1, 0.8, 0.1], // state  0 -> emits  0 mostly
+    [0.1, 0.1, 0.8], // state +1 -> emits +1 mostly
 ];
 let hmm = TernaryHMM::with_params(pi, a, b).unwrap();
 
-let obs = vec![1, 1, -1, 0, 1];
+let obs = vec![Positive, Positive, Negative, Neutral, Positive];
 
-// ── Forward algorithm ──
-let (alpha, likelihood) = hmm.forward(&obs).unwrap();
-// alpha[t][i] = P(O_0..O_t, state_t = i)
+// -- Forward algorithm --
+// alpha[t][i] = P(state_t = i | O_0..O_t)  (the scaled filtering posterior;
+//               each row sums to 1 and never underflows, see "Numerical notes")
 // likelihood  = P(O)
+let (alpha, likelihood) = hmm.forward(&obs).unwrap();
 
-// ── Viterbi: most likely state sequence ──
+// -- Viterbi: most likely state sequence --
 let (path, log_prob) = hmm.viterbi(&obs).unwrap();
 
-// ── Filtering: P(state_t | O_0..O_t) ──
-let state = hmm.predict_state(&obs, 2).unwrap(); // state at t=2 given observations up to t=2
+// -- Filtering: most likely state at t=2 given observations up to t=2 --
+let state = hmm.predict_state(&obs, 2).unwrap();
 
-// ── Smoothing: P(state_t | ALL observations) ──
-let state = hmm.smooth_state(&obs, 2).unwrap(); // state at t=2 given all observations
+// -- Smoothing: most likely state at t=2 given ALL observations --
+let state = hmm.smooth_state(&obs, 2).unwrap();
 
-// ── Baum-Welch training ──
+// -- Baum-Welch training --
 let mut hmm2 = TernaryHMM::new(); // start uniform
-let training_obs = vec![1, 1, 1, 0, 0, -1, -1, -1, 1, 1];
+let training_obs = vec![
+    Positive, Positive, Positive, Neutral, Neutral, Negative, Negative, Negative, Positive,
+    Positive,
+];
 let likelihoods = hmm2.baum_welch(&training_obs, 100, 1e-8).unwrap();
-// likelihoods: monotonically non-decreasing (guaranteed by EM)
+// likelihoods: per-iteration P(O), non-decreasing by the EM guarantee
+let _ = (alpha, likelihood, path, log_prob, state, likelihoods);
 ```
+
+`Ternary` (re-exported from `ternary-types`) is the observation/state type — the three
+variants are `Negative` (-1), `Neutral` (0) and `Positive` (+1).
 
 ## Architecture
 
-```
+```text
                  TernaryHMM λ = (π, A, B)
                  ┌─────────────────────────┐
                  │ π: initial state probs   │  [f64; 3]
@@ -81,41 +92,78 @@ let likelihoods = hmm2.baum_welch(&training_obs, 100, 1e-8).unwrap();
 
 All algorithms work on fixed-size 3×3 arrays — no heap allocation for the core DP tables (only for the time dimension, which scales with observation length T).
 
+## Numerical notes
+
+The forward and backward recursions use **Rabiner scaling** (L. R. Rabiner, 1989): each
+time step is normalized by its own scaling coefficient `c[t]`. This is essential because the
+unscaled joint probability `P(O_0..O_t, state_t)` is a product of many sub-unit terms that
+collapses to `0.0` after only a few hundred observations — silently breaking training and
+smoothing.
+
+With matching scales:
+
+- `alpha[t][i] = P(state_t = i | O_0..O_t)` — the **filtering** posterior (row-stochastic).
+- `alpha[t][i] * beta[t][i] = P(state_t = i | O)` — the **smoothing** posterior, which sums
+  to exactly 1 over `i` for every `t` (this is what the forward/backward consistency test
+  checks). `smooth_state` therefore never divides by `P(O)`, avoiding the division-by-zero
+  that the previous unscaled code hit when `P(O)` underflowed.
+- Baum-Welch drives its convergence decision from the **log-likelihood** `Σ ln(c[t])`, which
+  stays finite when `P(O) = Π c[t]` underflows on long sequences.
+
 ## API Reference
 
 ### Model Construction
 
 ```rust
-let hmm = TernaryHMM::new();  // uniform initialization
-let hmm = TernaryHMM::with_params(pi: [f64; 3], a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> Result<_, String>;
+# use ternary_hmm::TernaryHMM;
+let hmm = TernaryHMM::new(); // uniform initialization
+let hmm = TernaryHMM::with_params(
+    [0.2, 0.5, 0.3],
+    [[0.7, 0.2, 0.1], [0.1, 0.8, 0.1], [0.1, 0.2, 0.7]],
+    [[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]],
+)
+.unwrap();
+// Parameters are validated: each row must sum to 1.0 (within 1e-6), and every
+// entry must be finite and non-negative (a row like [2, -0.5, -0.5] sums to 1
+// but would yield ln(negative) = NaN in Viterbi).
 ```
-
-Parameters are validated: each row must sum to 1.0 (within 1e-6 tolerance).
 
 ### Inference
 
-| Method | Returns | Complexity |
-|--------|---------|-----------|
-| `forward(&obs)` | `(alpha: Vec<[f64; 3]>, likelihood: f64)` | O(T·9) |
-| `backward(&obs)` | `beta: Vec<[f64; 3]>` | O(T·9) |
-| `sequence_likelihood(&obs)` | `P(O): f64` | O(T·9) |
-| `viterbi(&obs)` | `(path: Vec<Trit>, log_prob: f64)` | O(T·9) |
-| `predict_state(&obs, t)` | `Trit` (filtering) | O(T·9) |
-| `smooth_state(&obs, t)` | `Trit` (smoothing) | O(T·9) |
+| Method              | Returns                                          | Complexity |
+| ------------------- | ------------------------------------------------ | ---------- |
+| `forward(&obs)`     | `(alpha: Vec<[f64; 3]>, likelihood: f64)`        | O(T·9)     |
+| `backward(&obs)`    | `beta: Vec<[f64; 3]>`                            | O(T·9)     |
+| `sequence_likelihood(&obs)` | `P(O): f64`                             | O(T·9)     |
+| `viterbi(&obs)`     | `(path: Vec<Ternary>, log_prob: f64)`            | O(T·9)     |
+| `predict_state(&obs, t)` | `Ternary` (filtering)                        | O(T·9)     |
+| `smooth_state(&obs, t)` | `Ternary` (smoothing)                        | O(T·9)     |
+
+`alpha[t][i]` and `beta[t][i]` are the scaled values described under "Numerical notes".
+Float comparisons use `f64::total_cmp`, so the arg-max in filtering/Viterbi never panics on
+`NaN`.
 
 ### Training
 
 ```rust
-hmm.baum_welch(&obs, max_iter: usize, tol: f64) -> Result<Vec<f64>, String>
-// Returns per-iteration likelihoods (should be non-decreasing)
+# use ternary_hmm::TernaryHMM;
+# use ternary_hmm::Ternary::{Negative, Neutral, Positive};
+# let mut hmm = TernaryHMM::new();
+# let obs = vec![Positive, Neutral, Negative];
+let likelihoods = hmm.baum_welch(&obs, 100, 1e-8).unwrap();
+// Returns per-iteration likelihoods P(O) (non-decreasing by the EM guarantee).
+// A perfectly uniform model is a fixed point (the three states are
+// indistinguishable), so start from a symmetry-broken / perturbed init when you
+// want transitions to be learned.
 ```
 
 ### Utilities
 
 ```rust
-fn trit_to_index(t: Trit) -> usize;   // {-1, 0, 1} → {0, 1, 2}
-fn index_to_trit(i: usize) -> Trit;   // {0, 1, 2} → {-1, 0, 1}
-fn validate_ternary(seq: &[Trit]) -> Result<(), String>;
+# use ternary_hmm::{index_to_trit, trit_to_index, validate_ternary, Ternary};
+let idx = trit_to_index(Ternary::Positive); // -> 2
+let t = index_to_trit(0); // -> Ternary::Negative
+let _ = validate_ternary(&[Ternary::Positive, Ternary::Neutral]); // always Ok
 ```
 
 ## Real-world example
@@ -139,20 +187,20 @@ Smoothing (using all 252 days) gives much better regime estimates at the boundar
 
 ## Performance
 
-| Operation | Time | Space |
-|-----------|------|-------|
-| Forward/Backward | O(T·9) | O(T·3) |
-| Viterbi | O(T·9) | O(T·3) |
-| Baum-Welch iteration | O(T·27) | O(T·9) |
+| Operation          | Time     | Space   |
+| ------------------ | -------- | ------- |
+| Forward/Backward   | O(T·9)   | O(T·3)  |
+| Viterbi            | O(T·9)   | O(T·3)  |
+| Baum-Welch iteration | O(T·27) | O(T·9)  |
 
 Since N=3 is fixed, the N² factor is always 9. The algorithms scale linearly with observation length T. For T=10,000, a single forward pass takes microseconds.
 
 ## Consistency guarantees
 
-- Forward and backward algorithms produce the same P(O) (verified in tests to 1e-10 tolerance)
-- Baum-Welch likelihoods are monotonically non-decreasing
-- Viterbi always returns a valid ternary state sequence
-- All probabilities remain non-negative throughout training
+- Forward `alpha` and backward `beta` are scaled consistently, so `alpha[t][i] * beta[t][i]` is the exact smoothing posterior and sums to 1 over `i` for every `t` (verified in tests).
+- Baum-Welch likelihoods are monotonically non-decreasing (tested with a strict-improvement assertion that fails on an inert M-step).
+- Viterbi's returned path is a true maximum-probability path, cross-checked against brute-force enumeration of all `3^T` paths for small T.
+- All probabilities remain non-negative throughout training; `with_params` rejects NaN/infinite/negative entries.
 
 ## Open questions
 
@@ -167,7 +215,7 @@ Since N=3 is fixed, the N² factor is always 9. The algorithms scale linearly wi
 cargo test
 ```
 
-13 tests: forward/backward consistency (P(O) matches to 1e-10), manually computed alpha values, Viterbi on unambiguous sequences, Baum-Welch monotonic likelihood, known-sequence decoding, filtering/smoothing agreement, parameter validation, edge cases (empty sequences, invalid trits).
+The README code blocks above are compiled and run as doctests. There are 14 unit tests: forward/backward posterior consistency, a hand-computed forward likelihood, Viterbi on unambiguous sequences, Viterbi cross-checked against brute-force enumeration of all paths, Baum-Welch monotonic + strictly-increasing likelihood, Baum-Welch stability on a 700-observation sequence (no underflow), known-sequence decoding, filtering/smoothing agreement, parameter validation (row sums plus negative/NaN/infinity rejection), and edge cases (empty sequences).
 
 ## License
 
